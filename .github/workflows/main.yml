@@ -1,0 +1,135 @@
+name: Terraform Deploy commonservices
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+          - stage
+          - prod
+      application:
+        description: 'Application'
+        required: true
+        default: 'commonservices'
+        type: choice
+        options:
+          - commonservices    
+      selected_services:
+        description: |
+          'Enter ArgoApps with paths to deploy(comma-separated):     
+             1. secrets:helm-deployment/commonservices1.0/secretsmanagerchart       
+             2. nginxlog:helm-deployment/commonservices1.0/commonservicesnginxingresslogschart
+             3. keycloak:helm-deployment/commonservices1.0/keycloakchart'
+        required: true
+        default: "secrets:helm-deployment/commonservices1.0/secretsmanagerchart,nginxlog:helm-deployment/commonservices1.0/commonservicesnginxingresslogschart,keycloak:helm-deployment/commonservices1.0/keycloakchart"         
+      dbEnabled:
+        description: 'Plan DB'
+        required: true
+        default: 'false'
+        type: boolean        
+      remoteProvisionerEnabled:
+        description: 'Plan ArgoApps to deploy'
+        required: true
+        default: 'false'
+        type: boolean          
+      terraformApply:
+        description: 'Apply changes after Plan'
+        required: true
+        default: 'false'
+        type: boolean             
+
+env:
+  ENVIRONMENT: ${{ github.event.inputs.environment }}
+  APPLICATION: ${{ github.event.inputs.application }}
+  DB_PLAN: ${{ github.event.inputs.dbEnabled }} 
+  REMOTEPROVISIONER_PLAN: ${{ github.event.inputs.remoteProvisionerEnabled }}   
+  TERRAFORM_APPLY: ${{ github.event.inputs.terraformApply }}  
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v1
+      with:
+        terraform_version: 1.7.2
+
+    - name: Set OCI Credentials
+      run: |
+        echo "OCI_TENANCY_OCID=${{ secrets.OCI_TENANCY_OCID }}" >> $GITHUB_ENV
+        echo "OCI_USER_OCID=${{ secrets.OCI_USER_OCID }}" >> $GITHUB_ENV
+        echo "OCI_FINGERPRINT=${{ secrets.OCI_FINGERPRINT }}" >> $GITHUB_ENV
+        echo "OCI_REGION=${{ secrets.OCI_REGION }}" >> $GITHUB_ENV
+        echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/private_key.pem
+        chmod 600 ~/.oci/private_key.pem
+
+    - name: Create .tfvars file with Hardcoded Cluster & Jump Server Details
+      if: env.APPLICATION == 'commonservices'
+      working-directory: ./terraform_argoapp_database/applications/${{ env.APPLICATION }}/environments/${{ env.ENVIRONMENT }}
+      run: |  
+        selected_services="${{ github.event.inputs.selected_services }}"
+        selected_paths=$(echo $selected_services | tr ',' '\n' | sed 's/^/"/;s/$/"/' | paste -sd "," -)  
+
+        cat <<EOF > runtime-variables.tfvars
+        # Hardcoded Jump Server Details
+        jump_server_ip = "192.168.1.10"
+        jump_server_user = "opc"
+        jump_server_ssh_key = "${{ secrets.JUMP_SERVER_SSH_KEY }}"
+
+        # Hardcoded Kubernetes Cluster Details
+        kubeconfig_path = "/home/opc/.kube/config"
+        k8s_cluster_name = "oci-k8s-cluster"
+        k8s_namespace = "argo-namespace"
+
+        # OCI Auth Details
+        oci_tenancy_ocid = "${{ env.OCI_TENANCY_OCID }}"
+        oci_user_ocid = "${{ env.OCI_USER_OCID }}"
+        oci_fingerprint = "${{ env.OCI_FINGERPRINT }}"
+        oci_region = "${{ env.OCI_REGION }}"
+
+        # GitHub Authentication
+        github_username = "${{ secrets.GITHUB_USERNAME }}"
+        github_password = "${{ secrets.GITHUB_TOKEN }}"
+
+        # ArgoCD Application Paths
+        argocd_application_helmservicename-with-path = [$selected_paths]
+        EOF
+
+    - name: Show Generated runtime-variables.tfvars
+      if: env.APPLICATION == 'commonservices'
+      working-directory: ./terraform_argoapp_database/applications/${{ env.APPLICATION }}/environments/${{ env.ENVIRONMENT }}    
+      run: cat runtime-variables.tfvars  
+
+    - name: Initialize and Plan Terraform RemoteProvisioner
+      if: env.REMOTEPROVISIONER_PLAN == 'true'
+      working-directory: ./terraform_argoapp_database/applications/${{ env.APPLICATION }}/environments/${{ env.ENVIRONMENT }}/remoteprovisioner
+      run: |
+        terraform init
+        terraform plan -var-file="../runtime-variables.tfvars" -var-file="../${{ env.ENVIRONMENT }}-terraform.tfvars"
+
+    - name: Initialize and Plan Terraform DB
+      if: env.DB_PLAN == 'true'
+      working-directory: ./terraform_argoapp_database/applications/${{ env.APPLICATION }}/environments/${{ env.ENVIRONMENT }}/db
+      run: |
+        terraform init
+        terraform plan -var-file="../runtime-variables.tfvars" -var-file="../${{ env.ENVIRONMENT }}-terraform.tfvars"
+
+    - name: Apply Terraform RemoteProvisioner
+      if: env.REMOTEPROVISIONER_APPLY == 'true'
+      working-directory: ./terraform_argoapp_database/applications/${{ env.APPLICATION }}/environments/${{ env.ENVIRONMENT }}/remoteprovisioner
+      run: terraform apply -var-file="../runtime-variables.tfvars" -var-file="../${{ env.ENVIRONMENT }}-terraform.tfvars" -auto-approve
+
+    - name: Apply Terraform DB
+      if: env.DB_APPLY == 'true'
+      working-directory: ./terraform_argoapp_database/applications/${{ env.APPLICATION }}/environments/${{ env.ENVIRONMENT }}/db
+      run: terraform apply -var-file="../runtime-variables.tfvars" -var-file="../${{ env.ENVIRONMENT }}-terraform.tfvars" -auto-approve
